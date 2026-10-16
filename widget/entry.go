@@ -99,6 +99,8 @@ type Entry struct {
 
 	// selectKeyDown indicates whether left shift or right shift is currently held down
 	selectKeyDown bool
+	// Suppress cursor-driven scrolling only during focus repaint/validation.
+	suppressCursorReveal bool
 	// tripleTapped records that the current touch selected a row, so the touch up must not move the cursor
 	tripleTapped bool
 
@@ -321,29 +323,37 @@ func (e *Entry) ExtendBaseWidget(wid fyne.Widget) {
 
 // FocusGained is called when the Entry has been given focus.
 func (e *Entry) FocusGained() {
-	e.setFieldsAndRefresh(func() {
-		e.hasFocused = true
-		e.dirty = true
-		e.focused = true
+	e.withoutCursorReveal(func() {
+		e.setFieldsAndRefresh(func() {
+			e.hasFocused = true
+			e.dirty = true
+			e.focused = true
+		})
 	})
 	if e.onFocusChanged != nil {
 		e.onFocusChanged(true)
 	}
 }
 
-// FocusLost is called when the Entry has had focus removed.
+// FocusLost repaints and validates without undoing manual scrolling.
 func (e *Entry) FocusLost() {
-	e.setFieldsAndRefresh(func() {
-		e.focused = false
-		e.selectKeyDown = false
+	e.withoutCursorReveal(func() {
+		e.setFieldsAndRefresh(func() { e.focused = false; e.selectKeyDown = false })
+		if e.Validator != nil {
+			e.validateWithoutRefresh()
+			e.Refresh()
+		}
 	})
-	if e.Validator != nil {
-		e.validateWithoutRefresh()
-		e.Refresh()
-	}
 	if e.onFocusChanged != nil {
 		e.onFocusChanged(false)
 	}
+}
+
+func (e *Entry) withoutCursorReveal(update func()) {
+	previous := e.suppressCursorReveal
+	e.suppressCursorReveal = true
+	defer func() { e.suppressCursorReveal = previous }()
+	update()
 }
 
 // Hide hides the entry.
@@ -630,22 +640,14 @@ func (e *Entry) TappedSecondary(pe *fyne.PointEvent) {
 	e.popUp.ShowAtPosition(popUpPos)
 }
 
-// TouchDown is called when this entry gets a touch down event on mobile device, we ensure we have focus.
+// TouchDown records a mobile touch without changing focus before a tap is recognised.
 //
 // Since: 2.1
 func (e *Entry) TouchDown(*mobile.TouchEvent) {
 	e.syncSegments()
-	if !e.Disabled() {
-		e.requestFocus()
-	}
 
 	// a triple tap is timed from the touch down, so it must be detected here rather than on touch up
 	e.tripleTapped = isTripleTap(e.sel.doubleTappedAtUnixMillis, time.Now().UnixMilli())
-	if e.tripleTapped {
-		e.sel.selectCurrentRow(false)
-		e.CursorColumn = e.sel.cursorColumn
-		e.Refresh()
-	}
 }
 
 // TouchUp is called when this entry gets a touch up event on mobile device.
@@ -653,8 +655,15 @@ func (e *Entry) TouchDown(*mobile.TouchEvent) {
 //
 // Since: 2.1
 func (e *Entry) TouchUp(ev *mobile.TouchEvent) {
+	// Only a completed tap may transfer focus and change the keyboard.
+	if !e.Disabled() {
+		e.requestFocus()
+	}
 	if e.tripleTapped {
 		e.tripleTapped = false
+		e.sel.selectCurrentRow(false)
+		e.CursorColumn = e.sel.cursorColumn
+		e.Refresh()
 		return
 	}
 
@@ -1994,7 +2003,9 @@ func (r *entryContentRenderer) moveCursor() {
 	r.cursor.Move(r.content.entry.CursorPosition())
 
 	callback := r.content.entry.OnCursorChanged
-	r.ensureCursorVisible()
+	if !r.content.entry.suppressCursorReveal {
+		r.ensureCursorVisible()
+	}
 
 	if callback != nil {
 		callback()

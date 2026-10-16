@@ -19,6 +19,14 @@ import (
 
 var _ fyne.Canvas = (*canvas)(nil)
 
+type tapGesture struct {
+	target      fyne.CanvasObject
+	focusTarget fyne.CanvasObject
+	overlay     fyne.CanvasObject
+	layer       int
+	moved       bool
+}
+
 type canvas struct {
 	common.Canvas
 	content        fyne.CanvasObject
@@ -31,6 +39,7 @@ type canvas struct {
 	padded         bool
 	scale          float32
 	size           fyne.Size
+	gestures       map[int]tapGesture
 	touched        map[int]mobile.Touchable
 	windowHead     *fyne.Container
 
@@ -63,6 +72,7 @@ func newCanvas(dev fyne.Device) fyne.Canvas {
 		padded:         true,
 		scale:          dev.SystemScaleForWindow(nil), // we don't need a window parameter on mobile,
 		touched:        make(map[int]mobile.Touchable),
+		gestures:       make(map[int]tapGesture),
 	}
 	ret.Initialize(ret, ret.overlayChanged)
 	return ret
@@ -120,6 +130,7 @@ func (c *canvas) Resize(size fyne.Size) {
 	}
 
 	c.sizeContent(size)
+	c.revealFocusedEntry()
 }
 
 func (c *canvas) Scale() float32 {
@@ -238,6 +249,8 @@ func (c *canvas) tapDown(pos fyne.Position, tapID int) {
 		return false
 	})
 
+	target, _, _ := c.findTapTarget(pos)
+	c.gestures[tapID] = tapGesture{target: target, focusTarget: co, overlay: c.Overlays().Top(), layer: layer}
 	if wid, ok := co.(mobile.Touchable); ok {
 		touchEv := &mobile.TouchEvent{}
 		touchEv.ID = tapID
@@ -247,11 +260,8 @@ func (c *canvas) tapDown(pos fyne.Position, tapID int) {
 		c.touched[tapID] = wid
 	}
 
-	if layer != 1 { // 0 - overlay, 1 - window head / menu, 2 - content
-		if wid, ok := co.(fyne.Focusable); !ok || wid != c.Focused() {
-			c.Unfocus()
-		}
-	}
+	// Focus is committed only after recognising a tap, before callbacks.
+
 }
 
 func (c *canvas) tapMove(pos fyne.Position, tapID int,
@@ -263,6 +273,10 @@ func (c *canvas) tapMove(pos fyne.Position, tapID int,
 
 	if c.dragging == nil && (math.Abs(float64(deltaX)) < tapMoveThreshold && math.Abs(float64(deltaY)) < tapMoveThreshold) {
 		return
+	}
+	if gesture, ok := c.gestures[tapID]; ok {
+		gesture.moved = true
+		c.gestures[tapID] = gesture
 	}
 	c.lastTapDownPos[tapID] = pos
 	offset := fyne.Delta{DX: deltaX, DY: deltaY}
@@ -277,6 +291,26 @@ func (c *canvas) tapMove(pos fyne.Position, tapID int,
 
 		return false
 	})
+	// Prefer a scroll that has content in the gesture's dominant axis.
+	// Single-line entries otherwise trap vertical drags in their empty scroller.
+	_, scrollHit := co.(*container.Scroll)
+	_, keyboardHit := co.(mobile.Keyboardable)
+	if (scrollHit || keyboardHit) && c.dragging == nil {
+		vertical := math.Abs(float64(deltaY)) > math.Abs(float64(deltaX))
+		candidate, candidatePos, _ := c.findObjectAtPositionMatching(pos, func(object fyne.CanvasObject) bool {
+			scroll, ok := object.(*container.Scroll)
+			if !ok || scroll.Content == nil {
+				return false
+			}
+			if vertical {
+				return scroll.Direction != container.ScrollHorizontalOnly && scroll.Direction != container.ScrollNone && scroll.Content.Size().Height > scroll.Size().Height
+			}
+			return scroll.Direction != container.ScrollVerticalOnly && scroll.Direction != container.ScrollNone && scroll.Content.Size().Width > scroll.Size().Width
+		})
+		if candidate != nil {
+			co, objPos = candidate, candidatePos
+		}
+	}
 	var scrollOtherDirection fyne.CanvasObject
 	if scr, ok := co.(*container.Scroll); ok {
 		switch scr.Direction {
@@ -343,6 +377,20 @@ func (c *canvas) tapUp(pos fyne.Position, tapID int,
 	doubleTapCallback func(fyne.DoubleTappable, *fyne.PointEvent),
 	dragCallback func(fyne.Draggable, *fyne.DragEvent),
 ) {
+	gesture, exists := c.gestures[tapID]
+	if !exists {
+		return
+	}
+	defer func() {
+		delete(c.gestures, tapID)
+		delete(c.lastTapDown, tapID)
+		delete(c.lastTapDownPos, tapID)
+		delete(c.lastTapDelta, tapID)
+		if touched := c.touched[tapID]; touched != nil {
+			touched.TouchCancel(&mobile.TouchEvent{PointEvent: fyne.PointEvent{AbsolutePosition: pos}, ID: tapID})
+		}
+		delete(c.touched, tapID)
+	}()
 	if c.dragging != nil {
 		previousDelta := c.lastTapDelta[tapID]
 		ev := &fyne.DragEvent{Dragged: previousDelta}
@@ -374,19 +422,25 @@ func (c *canvas) tapUp(pos fyne.Position, tapID int,
 		return
 	}
 
-	co, objPos, _ := c.findObjectAtPositionMatching(pos, func(object fyne.CanvasObject) bool {
-		if _, ok := object.(fyne.Tappable); ok {
-			return true
-		} else if _, ok := object.(fyne.SecondaryTappable); ok {
-			return true
-		} else if _, ok := object.(mobile.Touchable); ok {
-			return true
-		} else if _, ok := object.(fyne.DoubleTappable); ok {
-			return true
+	co, objPos, _ := c.findTapTarget(pos)
+	if gesture.moved || co != gesture.target || c.Overlays().Top() != gesture.overlay {
+		return
+	}
+	if co != nil && !c.tapTargetActive(co, gesture.overlay) {
+		return
+	}
+	// Freeze target and local coordinates before focus callbacks resize the UI.
+	// Entry.TouchUp transfers keyboard focus directly, without hide/show.
+	if gesture.layer != 1 {
+		if _, keyboardable := gesture.focusTarget.(mobile.Keyboardable); !keyboardable {
+			if focused, ok := gesture.focusTarget.(fyne.Focusable); !ok || focused != c.Focused() {
+				c.Unfocus()
+			}
 		}
-
-		return false
-	})
+	}
+	if co != nil && !c.tapTargetActive(co, gesture.overlay) {
+		return
+	}
 
 	if wid, ok := co.(mobile.Touchable); ok {
 		touchEv := &mobile.TouchEvent{}
@@ -395,6 +449,13 @@ func (c *canvas) tapUp(pos fyne.Position, tapID int,
 		touchEv.AbsolutePosition = pos
 		wid.TouchUp(touchEv)
 		c.touched[tapID] = nil
+	}
+
+	if co != nil && !c.tapTargetActive(co, gesture.overlay) {
+		return
+	}
+	if _, keyboardable := co.(mobile.Keyboardable); keyboardable {
+		c.revealFocusedEntry()
 	}
 
 	ev := &fyne.PointEvent{
@@ -414,7 +475,7 @@ func (c *canvas) tapUp(pos fyne.Position, tapID int,
 				cancel()
 				return
 			}
-			go c.waitForDoubleTap(co, ev, tapCallback, doubleTapCallback)
+			go c.waitForDoubleTap(co, ev, gesture.overlay, tapCallback, doubleTapCallback)
 		} else {
 			if wid, ok := co.(fyne.Tappable); ok {
 				tapCallback(wid, ev)
@@ -441,7 +502,89 @@ func (c *canvas) tapUp(pos fyne.Position, tapID int,
 	}
 }
 
-func (c *canvas) waitForDoubleTap(co fyne.CanvasObject, ev *fyne.PointEvent, tapCallback func(fyne.Tappable, *fyne.PointEvent), doubleTapCallback func(fyne.DoubleTappable, *fyne.PointEvent)) {
+// revealFocusedEntry follows keyboard/viewport changes without timers. It
+// scrolls only ancestors of the focused input, never the entry's own text.
+// Ordinary drag scrolling does not call this, so focus does not pin the page.
+func (c *canvas) revealFocusedEntry() {
+	focused, ok := c.Focused().(mobile.Keyboardable)
+	if !ok {
+		return
+	}
+	target, ok := focused.(fyne.CanvasObject)
+	if !ok {
+		return
+	}
+	var ancestors, path []*container.Scroll
+	for _, root := range c.ObjectTrees() {
+		found := intdriver.WalkVisibleObjectTree(root, func(object fyne.CanvasObject, _, _ fyne.Position, _ fyne.Size) bool {
+			if object == target {
+				path = append(path, ancestors...)
+				return true
+			}
+			if scroll, ok := object.(*container.Scroll); ok {
+				ancestors = append(ancestors, scroll)
+			}
+			return false
+		}, func(object fyne.CanvasObject, _ fyne.Position, _ fyne.CanvasObject) {
+			if _, ok := object.(*container.Scroll); ok {
+				ancestors = ancestors[:len(ancestors)-1]
+			}
+		})
+		if found {
+			break
+		}
+	}
+	margin := theme.Padding() * 2
+	for i := len(path) - 1; i >= 0; i-- {
+		scroll := path[i]
+		if scroll.Content == nil || scroll.Direction == container.ScrollHorizontalOnly || scroll.Direction == container.ScrollNone {
+			continue
+		}
+		height := scroll.Size().Height
+		if height <= 0 || scroll.Content.Size().Height <= height {
+			continue
+		}
+		top := intdriver.AbsolutePositionForObject(target, c.ObjectTrees()).Y - intdriver.AbsolutePositionForObject(scroll, c.ObjectTrees()).Y
+		bottom := top + target.Size().Height
+		delta := float32(0)
+		if top < margin {
+			delta = top - margin
+		} else if bottom > height-margin {
+			delta = bottom - height + margin
+		}
+		offset := scroll.Offset.Y + delta
+		offset = max(float32(0), min(offset, scroll.Content.Size().Height-height))
+		scroll.ScrollToOffset(fyne.NewPos(scroll.Offset.X, offset))
+	}
+}
+
+// Use the same hit test at both ends of a touch, before focus changes.
+func (c *canvas) findTapTarget(pos fyne.Position) (fyne.CanvasObject, fyne.Position, int) {
+	return c.findObjectAtPositionMatching(pos, func(object fyne.CanvasObject) bool {
+		switch object.(type) {
+		case fyne.Tappable, fyne.SecondaryTappable, fyne.DoubleTappable, mobile.Touchable:
+			return true
+		}
+		return false
+	})
+}
+
+func (c *canvas) tapTargetActive(target fyne.CanvasObject, overlay fyne.CanvasObject) bool {
+	if target == nil || c.Overlays().Top() != overlay {
+		return false
+	}
+	if disabled, ok := target.(fyne.Disableable); ok && disabled.Disabled() {
+		return false
+	}
+	for _, root := range c.ObjectTrees() {
+		if intdriver.WalkVisibleObjectTree(root, func(object fyne.CanvasObject, _, _ fyne.Position, _ fyne.Size) bool { return object == target }, nil) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *canvas) waitForDoubleTap(co fyne.CanvasObject, ev *fyne.PointEvent, overlay fyne.CanvasObject, tapCallback func(fyne.Tappable, *fyne.PointEvent), doubleTapCallback func(fyne.DoubleTappable, *fyne.PointEvent)) {
 	ctx, cancel := context.WithDeadline(context.TODO(), time.Now().Add(tapDoubleDelay))
 	c.touchCancelLock.Lock()
 	c.touchCancelFunc = cancel
@@ -455,7 +598,9 @@ func (c *canvas) waitForDoubleTap(co fyne.CanvasObject, ev *fyne.PointEvent, tap
 		touchLast := c.touchLastTapped
 		c.touchCancelLock.Unlock()
 
-		if touchCount == 2 && touchLast == co {
+		if !c.tapTargetActive(co, overlay) {
+			// A delayed tap must not reach a removed control or a new modal.
+		} else if touchCount == 2 && touchLast == co {
 			if wid, ok := co.(fyne.DoubleTappable); ok {
 				doubleTapCallback(wid, ev)
 			}
