@@ -576,7 +576,13 @@ func (c *canvas) tapTargetActive(target fyne.CanvasObject, overlay fyne.CanvasOb
 	if disabled, ok := target.(fyne.Disableable); ok && disabled.Disabled() {
 		return false
 	}
-	for _, root := range c.ObjectTrees() {
+	// Window chrome is hit-tested separately and is absent from ObjectTrees.
+	// Include it so close/menu buttons are not discarded as detached targets.
+	roots := c.ObjectTrees()
+	if c.windowHead != nil {
+		roots = append(roots, c.windowHead)
+	}
+	for _, root := range roots {
 		if intdriver.WalkVisibleObjectTree(root, func(object fyne.CanvasObject, _, _ fyne.Position, _ fyne.Size) bool { return object == target }, nil) {
 			return true
 		}

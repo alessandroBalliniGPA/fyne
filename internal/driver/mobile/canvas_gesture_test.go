@@ -3,6 +3,7 @@
 package mobile
 
 import (
+	"fmt"
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	intdriver "fyne.io/fyne/v2/internal/driver"
@@ -181,4 +182,39 @@ func Test_canvas_GestureKeyboardResizeRevealsFocusedEntry(t *testing.T) {
 		scroll.ScrollToTop()
 		assert.Zero(t, scroll.Offset.Y, "manual scrolling must remain possible with focus")
 	}, true)
+}
+
+func Test_canvas_GestureWindowHeaderTarget(t *testing.T) {
+	for _, focused := range []bool{false, true} {
+		t.Run(fmt.Sprint("focused=", focused), func(t *testing.T) {
+			d.DoFromGoroutine(func() {
+				c := newCanvas(fyne.CurrentDevice()).(*canvas)
+				c.OnFocus, c.OnUnfocus = nil, nil
+				entry := widget.NewEntry()
+				c.SetContent(entry)
+				calls := 0
+				button := widget.NewButton("Close", func() { calls++ })
+				c.setWindowHead(container.NewWithoutLayout(button))
+				c.Resize(fyne.NewSize(320, 480))
+				c.windowHead.Move(fyne.NewPos(0, 0))
+				c.windowHead.Resize(fyne.NewSize(320, 48))
+				button.Move(fyne.NewPos(200, 0))
+				button.Resize(fyne.NewSize(100, 40))
+				if focused {
+					c.Focus(entry)
+				}
+				pos := fyne.NewPos(220, 20)
+				target, _, _ := c.findTapTarget(pos)
+				assert.Same(t, button, target)
+				c.tapDown(pos, 0)
+				gestureTap(c, pos)
+				assert.Equal(t, 1, calls, "window header buttons must receive valid taps")
+				button.Hide()
+				assert.False(t, c.tapTargetActive(button, nil))
+				button.Show()
+				c.setWindowHead(container.NewWithoutLayout())
+				assert.False(t, c.tapTargetActive(button, nil), "replaced headers must not receive stale taps")
+			}, true)
+		})
+	}
 }
